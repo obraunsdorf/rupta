@@ -324,8 +324,61 @@ impl<'pta, 'tcx, 'compilation> FuncPAGBuilder<'pta, 'tcx, 'compilation> {
                 operands: _,
                 destination: _,
                 ..
-            } => {}
-            _ => {}
+            } => {},
+
+            mir::TerminatorKind::Drop { place, .. } => {
+                self.visit_drop_terminator(place, location)
+            },
+            _ => {
+                debug!("Visiting non-handled terminator: {:?}", kind);
+            }
+        }
+    }
+
+    fn visit_drop_terminator(&mut self, place: &mir::Place<'tcx>, location: mir::Location) {
+        let (_path, ty) = self.get_path_and_type_for_place(place);
+        let drop_fn = rustc_middle::ty::Instance::resolve_drop_in_place(self.acx.tcx, ty);
+        debug!("visiting Drop terminator for type {:?}: {:?}", ty, drop_fn);
+        let gen_args = drop_fn.args;
+        let args = vec![Spanned {
+            span: rustc_span::DUMMY_SP,
+            node: mir::Operand::Copy(place.clone()),
+        }];
+        let destination = place; //TODO(obraunsdorf): this seems like a hack because usually a drop has no destination
+        match drop_fn.def {
+            rustc_middle::ty::InstanceDef::DropGlue(def_id, has_drop_glue) => {
+                debug!("type has actual drop glue: {:?}", has_drop_glue);
+                if let Some(ty) = has_drop_glue {
+                    match ty.kind() {
+                        ty::Dynamic(..) => {
+                            //TODO(obraunsdorf)
+                            warn!("cannot handle drop of dynamic objects yet")
+                        }
+                        ty::Adt(adt_def, gen_args) => {
+                            if let Some(destructor) = adt_def.destructor(self.tcx()) {
+                                let drop_impl = rustc_middle::ty::Instance::resolve(self.tcx(), rustc_middle::ty::ParamEnv::reveal_all(), destructor.did, gen_args);
+                                let drop_impl_def_id = drop_impl.unwrap().unwrap().def_id();
+                                debug!("drop_impl: {:?}", drop_impl_def_id);
+                                
+                                self.resolve_call(&drop_impl_def_id, &gen_args, &args, destination, location);
+                            } else {
+                                warn!("no destructor found for type {:?}", ty);
+                            }
+                            
+                        }
+
+                        _ => {
+                            //Comment(obraunsdorf): this seems to never cause any problems
+                            warn!("cannot handle drop of type {:?}", ty);
+                            assert!(false, "cannot handle drop of type {:?}", ty);
+                        }
+                    };
+                } else {
+                    self.resolve_call(&def_id, &gen_args, &args, destination, location);
+                }
+                
+            },
+            _ => assert!(false, "drop_fn is no DropGlue?"),
         }
     }
 
@@ -1060,7 +1113,7 @@ impl<'pta, 'tcx, 'compilation> FuncPAGBuilder<'pta, 'tcx, 'compilation> {
         if !util::is_trait_method(self.tcx(), *callee_def_id)
         {
             // Static functions or methods or associated functions not declared on a trait.
-            let callsite = self.new_callsite(self.func_id, location, args, destination);
+            let callsite: Rc<crate::mir::call_site::CallSiteS<_, Rc<Path>>> = self.new_callsite(self.func_id, location, args, destination);
             let callee_func_id = self.acx.get_func_id(*callee_def_id, gen_args);
             self.fpag.add_static_dispatch_callsite(callsite, callee_func_id);
         } else if let Some((callee_def_id, callee_substs)) =
